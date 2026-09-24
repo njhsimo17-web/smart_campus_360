@@ -1,0 +1,63 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function account() { return get(/databases/$(database)/documents/users/$(request.auth.uid)).data; }
+    function isAdmin() { return signedIn() && account().role == 'admin'; }
+    function isProfessor() { return signedIn() && account().role == 'professor'; }
+    function isStudent() { return signedIn() && account().role == 'student'; }
+
+    match /users/{uid} {
+      allow read: if signedIn() && (request.auth.uid == uid || isAdmin());
+      allow create: if signedIn() && request.auth.uid == uid;
+      allow update: if isAdmin() || (signedIn() && request.auth.uid == uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['firstName','lastName','updatedAt']));
+      allow delete: if isAdmin();
+    }
+    match /students/{apogee} {
+      allow read: if isAdmin() || isProfessor() || (isStudent() && resource.data.uid == request.auth.uid);
+      allow create: if signedIn() && request.resource.data.uid == request.auth.uid;
+      allow update: if isAdmin() || (isStudent() && resource.data.uid == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['firstName','lastName','phone','department','program','level','photo','updatedAt']));
+      allow delete: if isAdmin();
+    }
+    match /professors/{uid} {
+      allow read: if isAdmin() || isProfessor() || (signedIn() && request.auth.uid == uid);
+      allow create: if isAdmin() || (signedIn() && request.auth.uid == uid);
+      allow update: if isAdmin() || (signedIn() && request.auth.uid == uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['firstName','lastName','phone','department','photo','updatedAt']));
+      allow delete: if isAdmin();
+    }
+    match /classes/{id} {
+      allow read: if isAdmin() || (isProfessor() && resource.data.professorUid == request.auth.uid)
+        || (isStudent() && resource.data.active == true);
+      allow write: if isAdmin();
+    }
+    match /courseAssignments/{id} {
+      allow read: if isAdmin() || (isProfessor() && resource.data.professorUid == request.auth.uid) || isStudent();
+      allow write: if isAdmin();
+    }
+    match /classrooms/{id} { allow read: if signedIn(); allow write: if isAdmin(); }
+    match /devices/{id} { allow read: if isAdmin() || isProfessor(); allow write: if isAdmin(); }
+    match /sensors/{id} { allow read: if isAdmin() || isProfessor(); allow write: if isAdmin(); }
+    match /attendance/{id} {
+      allow read: if isAdmin() || isProfessor() || (isStudent() && resource.data.studentUid == request.auth.uid);
+      allow write: if isAdmin();
+    }
+    match /attendanceSessions/{id} {
+      allow read: if isAdmin() || (isProfessor() && resource.data.professorId == request.auth.uid);
+      allow create: if isProfessor() && request.resource.data.professorId == request.auth.uid;
+      allow update: if isProfessor() && resource.data.professorId == request.auth.uid
+        && request.resource.data.professorId == request.auth.uid;
+      allow delete: if isAdmin();
+    }
+    match /notifications/{id} {
+      allow read: if isAdmin() || (signedIn() && (resource.data.recipientUid == request.auth.uid || resource.data.role == account().role));
+      allow create: if isAdmin() || signedIn();
+      allow update: if isAdmin() || (signedIn() && resource.data.recipientUid == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read']));
+      allow delete: if isAdmin();
+    }
+    match /{document=**} { allow read, write: if false; }
+  }
+}
