@@ -46,9 +46,8 @@ service cloud.firestore {
     }
     match /attendanceSessions/{id} {
       allow read: if isAdmin() || (isProfessor() && resource.data.professorId == request.auth.uid);
-      allow create: if isProfessor() && request.resource.data.professorId == request.auth.uid;
-      allow update: if isProfessor() && resource.data.professorId == request.auth.uid
-        && request.resource.data.professorId == request.auth.uid;
+      // Session start and finish go through the authenticated backend so room locks stay atomic.
+      allow create, update: if false;
       allow delete: if isAdmin();
     }
     match /notifications/{id} {

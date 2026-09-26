@@ -12,6 +12,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: npm ci && npm run build
+      - uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_SMARTCOMPUS_D5CB4 }}
+          project_id: smartcompus-d5cb4
+      - uses: google-github-actions/setup-gcloud@v2
+      - run: npm install --global firebase-tools
+      - run: firebase deploy --only firestore:rules --project smartcompus-d5cb4 --non-interactive
       - uses: FirebaseExtended/action-hosting-deploy@v0
         with:
           repoToken: ${{ secrets.GITHUB_TOKEN }}
