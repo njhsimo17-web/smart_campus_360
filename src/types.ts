@@ -60,9 +60,15 @@ export type User = Student | Professor | Admin;
 
 export interface AttendanceRecord {
   id: string;
+  sessionId?: string;
   studentId: string;
   studentName: string;
   apogee: string;
+  department?: string;
+  program?: string;
+  level?: string;
+  filiere?: string;
+  niveau?: string;
   rfidUID: string;
   room: string;
   teacher: string;
@@ -71,6 +77,25 @@ export interface AttendanceRecord {
   duration?: string;
   status: 'Present' | 'Absent' | 'Late';
   date: Timestamp;
+}
+
+export interface AttendanceSession {
+  id: string;
+  department?: string;
+  program?: string;
+  level?: string;
+  /** Compatibility alias for program, retained for existing firmware. */
+  filiere?: string;
+  /** Compatibility alias for level, retained for existing firmware. */
+  niveau?: string;
+  room?: string;
+  professorId?: string;
+  professorName?: string;
+  status: 'En cours' | 'Terminée' | string;
+  date?: string;
+  startTime?: string;
+  endTime?: string;
+  createdAt?: Timestamp;
 }
 
 export interface Notification {

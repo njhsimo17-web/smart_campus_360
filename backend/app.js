@@ -1,5 +1,6 @@
 const express = require("express");
 const cors = require("cors");
+const academicNormalization = import("./academic-normalization.mjs");
 
 const ACTIVE = "En cours";
 const COMPLETED = "Terminée";
@@ -46,17 +47,29 @@ function createApp({ db, FieldValue, verifyIdToken = async () => null }) {
         return res.json({ success: true, session: null });
       }
       const session = sessionDoc.data();
-      return res.json({ success: true, session: { id: sessionDoc.id, room: session.room, filiere: session.filiere, niveau: session.niveau, professorName: session.professorName, status: session.status } });
+      const { hasCompleteSessionAcademics } = await academicNormalization;
+      if (!hasCompleteSessionAcademics(session)) return res.json({ success: true, session: null });
+      return res.json({ success: true, session: {
+        id: sessionDoc.id, room: session.room, department: session.department, program: session.program, level: session.level,
+        filiere: session.filiere, niveau: session.niveau, professorName: session.professorName, status: session.status,
+      } });
     } catch (error) { next(error); }
   });
 
   app.post("/api/sessions/start", async (req, res, next) => {
     try {
-      const { room, filiere, niveau, professorName, date, startTime } = req.body || {};
-      if (![room, filiere, niveau].every(value => typeof value === "string" && value.trim())) {
-        throw httpError(400, "INVALID_SESSION", "Room, program, and level are required.");
+      const { room, department, program, level, filiere, niveau, professorName, date, startTime } = req.body || {};
+      const { cleanAcademicValue, academicValuesMatch } = await academicNormalization;
+      if (![room, department, program, level].every(value => typeof value === "string" && cleanAcademicValue(value))) {
+        throw httpError(400, "INVALID_SESSION", "Department, program, level, and room are required.");
+      }
+      if ((filiere && !academicValuesMatch(filiere, program)) || (niveau && !academicValuesMatch(niveau, level))) {
+        throw httpError(400, "INVALID_SESSION", "Compatibility fields must match the selected program and level.");
       }
       const cleanRoom = room.trim();
+      const cleanDepartment = cleanAcademicValue(department);
+      const cleanProgram = cleanAcademicValue(program);
+      const cleanLevel = cleanAcademicValue(level);
       const sessionRef = db.collection("attendanceSessions").doc();
       const lockRef = db.collection("sessionRoomLocks").doc(roomLockId(cleanRoom));
       await db.runTransaction(async tx => {
@@ -69,13 +82,17 @@ function createApp({ db, FieldValue, verifyIdToken = async () => null }) {
           }
         }
         tx.set(sessionRef, {
-          date: date || "", startTime: startTime || "", filiere: filiere.trim(), niveau: niveau.trim(), room: cleanRoom,
+          date: date || "", startTime: startTime || "", department: cleanDepartment, program: cleanProgram, level: cleanLevel,
+          filiere: cleanProgram, niveau: cleanLevel, room: cleanRoom,
           professorId: req.identity.uid, professorName: String(professorName || "").trim(), status: ACTIVE,
           createdAt: FieldValue.serverTimestamp(),
         });
         tx.set(lockRef, { room: cleanRoom, sessionId: sessionRef.id, professorId: req.identity.uid, updatedAt: FieldValue.serverTimestamp() });
       });
-      return res.status(201).json({ success: true, session: { id: sessionRef.id, room: cleanRoom, filiere: filiere.trim(), niveau: niveau.trim(), professorName: String(professorName || "").trim(), status: ACTIVE } });
+      return res.status(201).json({ success: true, session: {
+        id: sessionRef.id, room: cleanRoom, department: cleanDepartment, program: cleanProgram, level: cleanLevel,
+        filiere: cleanProgram, niveau: cleanLevel, professorName: String(professorName || "").trim(), status: ACTIVE,
+      } });
     } catch (error) { next(error); }
   });
 
@@ -104,6 +121,7 @@ function createApp({ db, FieldValue, verifyIdToken = async () => null }) {
       if (typeof sessionId !== "string" || !sessionId.trim()) throw httpError(409, "NO_ACTIVE_SESSION", "No active session.");
       if (![rfidUID, event, room].every(value => typeof value === "string" && value.trim())) throw httpError(400, "INVALID_SCAN", "Badge UID, event, and room are required.");
       if (event !== "ENTRY" && event !== "EXIT") throw httpError(400, "INVALID_EVENT", "Event must be ENTRY or EXIT.");
+      const { hasCompleteSessionAcademics, isStudentEligibleForSession } = await academicNormalization;
       const normalizedUID = rfidUID.replace(/\s+/g, "").toUpperCase();
       const sessionRef = db.collection("attendanceSessions").doc(sessionId);
       const lockRef = db.collection("sessionRoomLocks").doc(roomLockId(room));
@@ -115,6 +133,7 @@ function createApp({ db, FieldValue, verifyIdToken = async () => null }) {
         if (!sessionDoc.exists) throw httpError(409, "NO_ACTIVE_SESSION", "No active session.");
         const session = sessionDoc.data();
         if (session.status !== ACTIVE) throw httpError(409, "SESSION_CLOSED", "Session is completed.");
+        if (!hasCompleteSessionAcademics(session)) throw httpError(409, "SESSION_RECREATE_REQUIRED", "This legacy session has no verified department, program, and level. End it and create a new session before scanning.");
         if (!session.room) throw httpError(409, "NO_ACTIVE_SESSION", "No active session.");
         if (normalize(session.room) !== normalize(room)) throw httpError(409, "ROOM_MISMATCH", "Session room does not match the device room.");
         if (!lock.exists || lock.data().sessionId !== sessionId || normalize(lock.data().room) !== normalize(room)) throw httpError(409, "SESSION_CLOSED", "Session is completed.");
@@ -126,8 +145,7 @@ function createApp({ db, FieldValue, verifyIdToken = async () => null }) {
         if (!studentId) throw httpError(409, "STUDENT_NOT_ELIGIBLE", "Student is not eligible for this session.");
         const attendanceRef = db.collection("attendance").doc(`${sessionId}_${studentId}`);
         const attendanceDoc = await tx.get(attendanceRef);
-        if (normalize(currentStudent.program || currentStudent.department || currentStudent.filiere) !== normalize(session.filiere)
-          || normalize(currentStudent.level || currentStudent.niveau || currentStudent.studyLevel) !== normalize(session.niveau)) {
+        if (!isStudentEligibleForSession(currentStudent, session)) {
           throw httpError(403, "STUDENT_NOT_ELIGIBLE", "Student is not eligible for this session.");
         }
         if (event === "EXIT" && (!attendanceDoc.exists || !attendanceDoc.data().entryTime)) throw httpError(409, "EXIT_WITHOUT_ENTRY", "An entry scan is required before exit.");
@@ -136,8 +154,8 @@ function createApp({ db, FieldValue, verifyIdToken = async () => null }) {
           if (!attendanceDoc.exists) tx.create(attendanceRef, {
             sessionId, studentUid: currentStudent.uid || studentId, studentId, studentApogee: currentStudent.apogee || studentDoc.id,
             studentName: fullName, firstName: currentStudent.firstName || "", lastName: currentStudent.lastName || "",
-            filiere: session.filiere, department: currentStudent.department || "", program: currentStudent.program || "",
-            niveau: session.niveau, level: currentStudent.level || "", rfidUID: normalizedUID,
+            filiere: session.program, department: session.department, program: session.program,
+            niveau: session.level, level: session.level, rfidUID: normalizedUID,
             entryTime: FieldValue.serverTimestamp(), room: session.room, deviceId: deviceId || "ESP32-01",
             status: "Présent", createdAt: FieldValue.serverTimestamp(), updatedAt: FieldValue.serverTimestamp(),
           });

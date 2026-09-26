@@ -14,6 +14,7 @@ import jsPDF from "jspdf";
 import autoTable from "jspdf-autotable";
 import { db } from "../../firebase";
 import StudentAvatar from "../../components/StudentAvatar";
+import { cleanAcademicValue, normalizeAcademicValue, academicValuesMatch } from "../../../backend/academic-normalization.mjs";
 
 export interface StudentRow {
   id: string;
@@ -50,42 +51,29 @@ const exportHeaders = [
   "RFID UID",
 ];
 
-export function normalizeDepartment(department: string): string {
-  if (!department) return "Unknown";
-  const value = department.trim().toLowerCase();
-  const map: Record<string, string> = {
-    "electronique embarquee": "Électronique Embarquée",
-    "électronique embarquée": "Électronique Embarquée",
-    "energies renouvelables": "Énergies Renouvelables",
-    "énergies renouvelables": "Énergies Renouvelables",
-    "systemes de telecommunication": "Systèmes de Télécommunication",
-    "systèmes de télécommunication": "Systèmes de Télécommunication",
-    physique: "Physique",
-    chimie: "Chimie",
-    informatique: "Informatique",
-    mathematiques: "Mathématiques",
-    mathématiques: "Mathématiques",
-    electronique: "Électronique",
-    électronique: "Électronique",
-    energie: "Énergie",
-    énergie: "Énergie",
-  };
-  return map[value] || value.charAt(0).toUpperCase() + value.slice(1);
-}
-
-function normalizeProgram(program: string): string {
-  if (!program) return "Programme non renseigné";
-  const value=program.trim().toLowerCase();
-  const map:Record<string,string>={"electronique embarquee":"Électronique Embarquée","électronique embarquée":"Électronique Embarquée","energies renouvelables":"Énergies Renouvelables","énergies renouvelables":"Énergies Renouvelables","systemes de telecommunication":"Systèmes de Télécommunication","systèmes de télécommunication":"Systèmes de Télécommunication"};
-  return map[value]||value.charAt(0).toUpperCase()+value.slice(1);
+export const normalizeDepartment = (department: string) => cleanAcademicValue(department) || "Unknown";
+const normalizeProgram = (program: string) => cleanAcademicValue(program) || "Program not recorded";
+function academicLabels(values: string[]) {
+  const labels = new Map<string, string>();
+  values.map(cleanAcademicValue).filter(Boolean).forEach(value => {
+    const key = normalizeAcademicValue(value);
+    if (!labels.has(key)) labels.set(key, value);
+  });
+  return [...labels.values()].sort((left, right) => left.localeCompare(right, "en"));
 }
 
 function groupStudents(rows: StudentRow[], key: "department" | "program" | "level") {
-  return rows.reduce<Record<string, StudentRow[]>>((groups, student) => {
-    const name = key === "department" ? normalizeDepartment(student.department) : key === "program" ? normalizeProgram(student.program) : student.level || "Unspecified";
-    (groups[name] ??= []).push(student);
-    return groups;
-  }, {});
+  const labels = new Map<string, string>();
+  const groups = new Map<string, StudentRow[]>();
+  rows.forEach(student => {
+    const raw = key === "department" ? student.department : key === "program" ? student.program : student.level;
+    const label = cleanAcademicValue(raw) || (key === "department" ? "Unknown" : key === "program" ? "Program not recorded" : "Unspecified");
+    const normalized = normalizeAcademicValue(label);
+    labels.set(normalized, labels.get(normalized) || label);
+    if (!groups.has(normalized)) groups.set(normalized, []);
+    groups.get(normalized)!.push(student);
+  });
+  return Object.fromEntries([...groups.entries()].map(([keyValue, group]) => [labels.get(keyValue)!, group]));
 }
 function initials(student: StudentRow) {
   return (
@@ -395,30 +383,25 @@ export default function ProfessorStudentsPage() {
       onSnapshot(
         query(collection(db, "students"), where("status", "==", "active")),
         (snapshot) => {
-          setStudents(
-            snapshot.docs.map((d) => {
-              const x = d.data();
-              const rawDepartment=String(x.department||"");
-              const legacyProgram=normalizeProgram(rawDepartment);
-              const isLegacyPhysicsProgram=["Électronique Embarquée","Énergies Renouvelables","Systèmes de Télécommunication"].includes(legacyProgram);
-              return {
-                id: d.id,
-                firstName: String(x.firstName || ""),
-                lastName: String(x.lastName || ""),
-                apogee: String(x.apogee || d.id),
-                department: isLegacyPhysicsProgram ? "Physique" : normalizeDepartment(rawDepartment),
-                program: normalizeProgram(String(x.program || (isLegacyPhysicsProgram ? rawDepartment : ""))),
-                level: String(x.level || "Unspecified"),
-                photo: String(x.photo || ""),
-                email: String(x.email || ""),
-                phone: String(x.phone || ""),
-                attendance: Number(x.attendance || 0),
-                present: x.present === true,
-                rfidUID: String(x.rfidUID || ""),
-                status: String(x.status || ""),
-              };
-            }),
-          );
+          setStudents(snapshot.docs.map(studentDoc => {
+            const student = studentDoc.data();
+            return {
+              id: studentDoc.id,
+              firstName: String(student.firstName || ""),
+              lastName: String(student.lastName || ""),
+              apogee: String(student.apogee || studentDoc.id),
+              department: cleanAcademicValue(String(student.department || "")),
+              program: cleanAcademicValue(String(student.program || "")),
+              level: cleanAcademicValue(String(student.level || "")),
+              photo: String(student.photo || ""),
+              email: String(student.email || ""),
+              phone: String(student.phone || ""),
+              attendance: Number(student.attendance || 0),
+              present: student.present === true,
+              rfidUID: String(student.rfidUID || ""),
+              status: String(student.status || ""),
+            };
+          }));
           setLoading(false);
           setError("");
         },
@@ -429,30 +412,19 @@ export default function ProfessorStudentsPage() {
       ),
     [],
   );
-  const departments = useMemo(
-    () => [...new Set(students.map((s) => normalizeDepartment(s.department)))].sort(),
-    [students],
-  );
-  const levels = useMemo(
-    () => [...new Set(students.map((s) => s.level))].sort(),
-    [students],
-  );
-  const programs = useMemo(
-    () => [...new Set([...(department==='Physique'?['Électronique Embarquée','Énergies Renouvelables','Systèmes de Télécommunication']:[]),...students.filter((s) => !department || s.department === department).map((s) => normalizeProgram(s.program))])].sort(),
-    [students, department],
-  );
-  const filtered = students.filter(
-    (s) =>
-      (!search ||
-        `${s.firstName} ${s.lastName} ${s.apogee}`
-          .toLowerCase()
-          .includes(search.toLowerCase())) &&
-      (!department || normalizeDepartment(s.department) === department) &&
-      (!program || normalizeProgram(s.program) === program) &&
-      (!level || s.level === level) &&
-      (!presence || (presence === "present") === s.present) &&
-      (!rfid || (rfid === "assigned") === Boolean(s.rfidUID)),
-  );
+  const departments = useMemo(() => academicLabels(students.map(student => student.department)), [students]);
+  const programs = useMemo(() => academicLabels(students
+    .filter(student => !department || academicValuesMatch(student.department, department)).map(student => student.program)), [students, department]);
+  const levels = useMemo(() => academicLabels(students.filter(student =>
+    (!department || academicValuesMatch(student.department, department))
+    && (!program || academicValuesMatch(student.program, program))).map(student => student.level)), [students, department, program]);
+  const filtered = students.filter(student =>
+    (!search || normalizeAcademicValue(`${student.firstName} ${student.lastName} ${student.apogee}`).includes(normalizeAcademicValue(search)))
+    && (!department || academicValuesMatch(student.department, department))
+    && (!program || academicValuesMatch(student.program, program))
+    && (!level || academicValuesMatch(student.level, level))
+    && (!presence || (presence === "present") === student.present)
+    && (!rfid || (rfid === "assigned") === Boolean(student.rfidUID)));
   const grouped = groupStudents(filtered, "department");
   return (
     <div className="space-y-6">
@@ -477,8 +449,8 @@ export default function ProfessorStudentsPage() {
           />
         </div>
         {[
-          [department, (value:string)=>{setDepartment(value);setProgram("")}, "All Departments", departments],
-          [program, setProgram, "All Programs", programs],
+          [department, (value:string)=>{setDepartment(value);setProgram("");setLevel("")}, "All Departments", departments],
+          [program, (value:string)=>{setProgram(value);setLevel("")}, "All Programs", programs],
           [level, setLevel, "All Levels", levels],
         ].map(([value, setter, label, options]) => (
           <select

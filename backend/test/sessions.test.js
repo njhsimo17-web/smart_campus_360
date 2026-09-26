@@ -37,15 +37,16 @@ class FakeRef {
   async create(value) { if (this.db.data.has(this.path)) throw new Error("already exists"); this.db.data.set(this.path, structuredClone(value)); }
 }
 
-let db; let server; let base;
+let db; let server; let base; let academic;
 const timestamp = () => "mock-time";
 const fetchJson = async (path, options) => { const response = await fetch(`${base}${path}`, options); return { status: response.status, body: await response.json() }; };
 const post = (path, body, token) => fetchJson(path, { method: "POST", headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) }, body: JSON.stringify(body) });
 
 before(async () => {
   db = new FakeFirestore();
+  academic = await import("../academic-normalization.mjs");
   db.data.set("users/prof-1", { role: "professor" });
-  db.data.set("students/P100", { uid: "student-uid-1", apogee: "P100", firstName: "Ada", lastName: "Lovelace", rfidUID: "A1B2", program: "Computer Engineering", level: "Year 1", present: false });
+  db.data.set("students/P100", { uid: "student-uid-1", apogee: "P100", firstName: "Ada", lastName: "Lovelace", rfidUID: "A1B2", department: "Computing", program: "Computer Engineering", level: "Year 1", present: false });
   const app = createApp({ db, FieldValue: { serverTimestamp: timestamp }, verifyIdToken: async token => ({ uid: token }) });
   server = app.listen(0);
   await new Promise(resolve => server.once("listening", resolve));
@@ -68,14 +69,32 @@ test("active session endpoint returns null only when no active session exists", 
   assert.equal(failure.body.success, false);
 });
 
+test("session start requires the explicit academic hierarchy and room", async () => {
+  const legacyBody = { room: "Validation Room", filiere: "Physique", niveau: "Master 1" };
+  const response = await post("/api/sessions/start", legacyBody, "prof-1");
+  assert.equal(response.status, 400);
+  assert.equal(response.body.code, "INVALID_SESSION");
+  assert.equal([...db.data.keys()].some(key => key.startsWith("attendanceSessions/")), false);
+});
+
 test("parallel starts cannot create two active sessions in one room", async () => {
-  const body = { room: "Amphi A", filiere: "Computer Engineering", niveau: "Year 1", professorName: "Professor Ada" };
+  const body = { room: "Amphi A", department: "Computing", program: "Computer Engineering", level: "Year 1", professorName: "Professor Ada" };
   const results = await Promise.all([post("/api/sessions/start", body, "prof-1"), post("/api/sessions/start", body, "prof-1")]);
   assert.deepEqual(results.map(result => result.status).sort(), [201, 409]);
+  const created = results.find(result => result.status === 201).body.session;
+  assert.equal(created.department, "Computing");
+  assert.equal(created.program, "Computer Engineering");
+  assert.equal(created.level, "Year 1");
+  assert.equal(created.filiere, created.program);
+  assert.equal(created.niveau, created.level);
   const active = await fetchJson("/api/sessions/active?room=Amphi%20A");
   assert.equal(active.body.session.room, "Amphi A");
   assert.equal(active.body.session.professorName, "Professor Ada");
+  assert.equal(active.body.session.department, "Computing");
+  assert.equal(active.body.session.program, "Computer Engineering");
+  assert.equal(active.body.session.filiere, active.body.session.program);
   assert.equal("student" in active.body.session, false);
+  assert.equal((await post("/api/sessions/start", { ...body, filiere: "Computing" }, "prof-1")).body.code, "INVALID_SESSION");
 });
 
 test("unknown badge, mismatched room, and ineligible student cannot change presence", async () => {
@@ -125,4 +144,100 @@ test("finishing releases the room and closed sessions reject scans", async () =>
 test("legacy sessions without a room never activate a device", async () => {
   db.data.set("attendanceSessions/legacy", { status: "En cours", filiere: "Computer Engineering", niveau: "Year 1" });
   assert.deepEqual((await fetchJson("/api/sessions/active?room=Amphi%20A")).body, { success: true, session: null });
+});
+
+test("shared academic normalization preserves the department-program-level hierarchy", () => {
+  const session = {
+    department: "Physique",
+    program: "Électronique Embarquée",
+    level: "Master 1",
+    filiere: "Électronique Embarquée",
+    niveau: "Master 1",
+  };
+  const student = {
+    department: "Physique",
+    program: "e\u0301lectronique   embarque\u0301e",
+    level: "  MASTER   1 ",
+  };
+  assert.equal(academic.isStudentEligibleForSession(student, session), true);
+  assert.equal(academic.isStudentEligibleForSession({ ...student, program: "Énergies Renouvelables" }, session), false);
+  assert.equal(academic.isStudentEligibleForSession({ ...student, department: "Chimie" }, session), false);
+  assert.equal(academic.isStudentEligibleForSession({ ...student, level: "Master 2" }, session), false);
+  assert.equal(academic.isStudentEligibleForSession({ ...student, program: "Physique" }, session), false);
+  assert.equal(academic.normalizeAcademicValue("Électronique Embarquée"), academic.normalizeAcademicValue("e\u0301lectronique   embarque\u0301e"));
+  assert.notEqual(academic.normalizeAcademicValue("Électronique Embarquée"), academic.normalizeAcademicValue("Énergies Renouvelables"));
+});
+
+test("example badge is eligible only for the exact department, program, and level", async () => {
+  const sessionBody = {
+    room: "Academic Test Room",
+    department: "Physique",
+    program: "Électronique Embarquée",
+    level: "Master 1",
+    professorName: "Professor Ada",
+  };
+  const started = await post("/api/sessions/start", sessionBody, "prof-1");
+  assert.equal(started.status, 201);
+  const session = started.body.session;
+  const profile = {
+    uid: "student-uid-c0ffee99",
+    apogee: "P200",
+    firstName: "Ada",
+    lastName: "Student",
+    department: "Physique",
+    program: "Électronique Embarquée",
+    level: "Master 1",
+    rfidUID: "C0FFEE99",
+    present: false,
+  };
+  db.data.set("students/P200", profile);
+  const payload = { sessionId: session.id, rfidUID: "C0FFEE99", event: "ENTRY", room: session.room };
+  const attendancePath = `attendance/${session.id}_${profile.uid}`;
+
+  for (const mismatch of [
+    { program: "Énergies Renouvelables" },
+    { department: "Chimie" },
+    { level: "Master 2" },
+  ]) {
+    db.data.set("students/P200", { ...profile, ...mismatch, present: false });
+    const response = await post("/api/rfid/scan", payload);
+    assert.equal(response.body.code, "STUDENT_NOT_ELIGIBLE");
+    assert.equal(db.data.has(attendancePath), false);
+    assert.equal(db.data.get("students/P200").present, false);
+  }
+
+  const normalizedProfile = {
+    ...profile,
+    program: "e\u0301lectronique   embarque\u0301e",
+    level: "  MASTER   1 ",
+  };
+  db.data.set("students/P200", normalizedProfile);
+  const accepted = await post("/api/rfid/scan", payload);
+  assert.equal(accepted.status, 200);
+  assert.equal(accepted.body.code, "ENTRY_RECORDED");
+  assert.equal(db.data.get(attendancePath).department, "Physique");
+  assert.equal(db.data.get(attendancePath).program, "Électronique Embarquée");
+  assert.equal(db.data.get(attendancePath).level, "Master 1");
+
+  await post("/api/sessions/finish", { sessionId: session.id }, "prof-1");
+});
+
+test("legacy active sessions stay visible to their owner but never enable scans", async () => {
+  const { roomLockId } = require("../app");
+  const room = "Legacy Room";
+  const legacySession = { room, filiere: "Physique", niveau: "Master 1", professorId: "prof-1", professorName: "Professor Ada", status: "En cours" };
+  db.data.set("attendanceSessions/legacy-active", legacySession);
+  db.data.set(`sessionRoomLocks/${roomLockId(room)}`, { room, sessionId: "legacy-active", professorId: "prof-1" });
+  db.data.set("students/LEGACY", { uid: "legacy-student", department: "Physique", program: "", level: "Master 1", rfidUID: "C0FFEE99", present: false });
+
+  assert.deepEqual((await fetchJson(`/api/sessions/active?room=${encodeURIComponent(room)}`)).body, { success: true, session: null });
+  const scan = await post("/api/rfid/scan", { sessionId: "legacy-active", rfidUID: "C0FFEE99", event: "ENTRY", room });
+  assert.equal(scan.body.code, "SESSION_RECREATE_REQUIRED");
+  assert.equal(db.data.get("students/LEGACY").present, false);
+  assert.equal([...db.data.keys()].some(key => key.startsWith("attendance/legacy-active_")), false);
+
+  const ended = await post("/api/sessions/finish", { sessionId: "legacy-active", endTime: "11:00" }, "prof-1");
+  assert.equal(ended.status, 200);
+  assert.equal(db.data.get("attendanceSessions/legacy-active").status, "Terminée");
+  assert.equal(db.data.has(`sessionRoomLocks/${roomLockId(room)}`), false);
 });
